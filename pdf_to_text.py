@@ -14,14 +14,15 @@ import openai
 import time
 import psycopg
 from pgvector.psycopg import register_vector
-
 from functools import partial
-
 from langchain.document_loaders import PyPDFLoader
 from langchain.document_loaders import ReadTheDocsLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 warnings.filterwarnings("ignore")
+
+# import streamlit as st
+# st.set_page_config("Hello")
 
 # from dotenv import load_dotenv
 # load_dotenv()
@@ -61,12 +62,6 @@ def init_pdf_module(is_reload_required):
             chunks = text_splitter.split_documents(data)
             return [{"text": chunk.page_content, "source": chunk.metadata["source"]} for chunk in chunks]
 
-    # Extract texts from images
-    texts_ds = ds.flat_map(ExtractPdfText, compute=ActorPoolStrategy(size=1))
-
-    # sample = texts_ds.take(ds.count())
-    # print("dumps print: ", json.dumps(sample, indent=2))
-
     class EmbedTexts:
         def __init__(self, model_name="thenlper/gte-base"):
             self.embedding_model = HuggingFaceEmbeddings(
@@ -83,15 +78,6 @@ def init_pdf_module(is_reload_required):
                 "embeddings": embeddings,
             }
 
-    embedded_texts = texts_ds.map_batches(
-        EmbedTexts,
-        fn_constructor_kwargs={"model_name": "thenlper/gte-base"},
-        compute=ActorPoolStrategy(size=1),
-    )
-
-    # sample = embedded_texts.take(1)
-    # print(f"embedding size: {len(sample[0]['embeddings'])}")
-
     class StoreEmbeddings:
         def __call__(self, batch):
             with psycopg.connect(DB_CONNECTION_STRING, password="postgres") as conn:
@@ -101,6 +87,21 @@ def init_pdf_module(is_reload_required):
                         cur.execute("INSERT INTO infographic (text, source, embedding) VALUES (%s, %s, %s)",
                                     (text, source, embedding,), )
             return {}
+
+    # Split texts of pdfs
+    texts_ds = ds.flat_map(ExtractPdfText, compute=ActorPoolStrategy(size=1))
+
+    # sample = texts_ds.take(ds.count())
+    # print("dumps print: ", json.dumps(sample, indent=2))
+
+    embedded_texts = texts_ds.map_batches(
+        EmbedTexts,
+        fn_constructor_kwargs={"model_name": "thenlper/gte-base"},
+        compute=ActorPoolStrategy(size=1),
+    )
+
+    # sample = embedded_texts.take(1)
+    # print(f"embedding size: {len(sample[0]['embeddings'])}")
 
     embedded_texts.map_batches(
         StoreEmbeddings,
@@ -112,14 +113,15 @@ def init_pdf_module(is_reload_required):
 
 # ***************END OF INIT_MODULE***************************#
 
-def semantic_search(query, embedding_model, num_infographics):
+
+def semantic_search(query, embedding_model, num_of_chunks):
     question_embedding = np.array(embedding_model.embed_query(query))
     with psycopg.connect(DB_CONNECTION_STRING, password="postgres") as conn:
         register_vector(conn)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, source, text FROM infographic ORDER BY embedding <=> %s LIMIT %s",
-                (question_embedding, num_infographics),
+                (question_embedding, num_of_chunks),
             )
             rows = cur.fetchall()
             print("rows: ", len(rows))
@@ -146,7 +148,7 @@ def generate_response(
                 model=llm,
                 temperature=temperature,
                 stream=False,
-                api_key="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",
+                api_key="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",
                 messages=[
                     {"role": "system", "content": system_content},
                     {"role": "assistant", "content": assistant_content},
@@ -159,6 +161,53 @@ def generate_response(
             time.sleep(retry_interval)
             retry_count += 1
     return ""
+
+
+class QueryAgent:
+    def __init__(self, embedding_model_name="thenlper/gte-base",
+                 llm="meta-llama/Llama-2-70b-chat-hf", temperature=0.0,
+                 max_context_length=4096, system_content="", assistant_content=""):
+        # Embedding model
+        self.embedding_model = HuggingFaceEmbeddings(model_name=embedding_model_name)
+
+        # Context length (restrict input length to 50% of total length)
+        max_context_length = int(0.5 * max_context_length)
+
+        # LLM
+        self.llm = llm
+        self.temperature = temperature
+        # self.context_length = max_context_length - get_num_tokens(system_content + assistant_content)
+        self.system_content = system_content
+        self.assistant_content = assistant_content
+
+    def __call__(self, query, num_chunks=5, stream=True):
+        # Get sources and context
+        context_results = semantic_search(
+            query=query,
+            embedding_model=self.embedding_model,
+            num_of_chunks=num_chunks)
+
+        # Generate response
+        context = [item["text"] for item in context_results]
+        sources = [item["source"] for item in context_results]
+        user_content = f"query: {query}, context: {context}"
+
+        answer = generate_response(
+            llm=self.llm,
+            temperature=self.temperature,
+            system_content=self.system_content,
+            assistant_content=self.assistant_content,
+            user_content=user_content)
+
+        # Result
+        result = {
+            "question": query,
+            "sources": sources,
+            "answer": answer,
+            "llm": self.llm,
+            "context": context,
+        }
+        return result
 
 
 def get_response_to_user_query():
@@ -187,9 +236,28 @@ def get_response_to_user_query():
     print(sources)
 
 
+def use_agent(input_query):
+    #llm = "meta-llama/Llama-2-7b-chat-hf"
+    llm = "gpt-4"
+    agent = QueryAgent(
+        embedding_model_name="thenlper/gte-base",
+        llm=llm,
+        system_content="Answer the query using the context provided. Be succinct.")
+    response = agent(query=input_query)
+    #print("query: ", input_query)
+    #answers = [item["answer"] for item in response]
+    #print(answers)
+    #sources = [item["sources"] for item in response]
+    #print(sources)
+    print("\n\n", json.dumps(response, indent=2))
+
+
 # ***************get_response_to_user_query***************************#
 
 # init_pdf_module(True)
-get_response_to_user_query()
+query = "whats the website mentioned to Get a quote for the completion of  template "
+use_agent(query)
+
+# get_response_to_user_query()
 # main()
 # query_summarize()
